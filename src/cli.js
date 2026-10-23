@@ -65,6 +65,9 @@ const ROOT = path.basename(__dirname) === 'src' ? path.resolve(__dirname, '..') 
 const KEYS_FILE = path.join(ROOT, 'keys.txt');
 const ACCOUNTS_FILE = path.join(ROOT, 'accounts.jsonl');
 const OUT_DIR = path.join(ROOT, 'out');
+const DEAD_FILE = path.join(ROOT, 'keys-dead.txt');
+/** Dead keys from the last verify run (one `key<TAB># reason` per line). */
+const writeDead = (dead) => fs.writeFileSync(DEAD_FILE, dead.map((d) => `${d.key}\t# ${d.why}`).join('\n') + (dead.length ? '\n' : ''));
 
 // ------------------------------------------------------------------ provider
 const BASE = 'https://api.sivan.bond';
@@ -249,7 +252,14 @@ async function exitFetch(proxy, url, { method = 'GET', headers = {}, body = null
     ? await connectThrough(proxy, u.hostname, u.port || 443, CONNECT_TIMEOUT_MS)
     : await directConnect(u.hostname, u.port || 443, CONNECT_TIMEOUT_MS);
   const sock = tls.connect({ socket: raw, servername: u.hostname });
-  await new Promise((res, rej) => { sock.once('secureConnect', res); sock.once('error', rej); });
+  await new Promise((res, rej) => {
+    // A black-holed exit accepts CONNECT and then never finishes the TLS
+    // handshake: without this timer the promise never settles and the whole wave
+    // (Promise.all of conc accounts) stalls for hours — measured 2026-10-23.
+    const t = setTimeout(() => { try { sock.destroy(); } catch {} rej(new Error('tls handshake timeout')); }, timeoutMs);
+    sock.once('secureConnect', () => { clearTimeout(t); res(); });
+    sock.once('error', (e) => { clearTimeout(t); rej(e); });
+  });
   const chunks = [];
   let resolve, reject;
   const p = new Promise((res, rej) => { resolve = res; reject = rej; });
@@ -671,16 +681,20 @@ async function verifyOnly() {
   const keys = readKeys();
   if (!keys.length) { console.log(`no keys in ${KEYS_FILE}`); process.exit(0); }
   let live = 0;
+  const dead = [];
   for (let i = 0; i < keys.length; i++) {
     const exit = exits[i % exits.length];
     try {
       const g = await chatGate(exit, keys[i]);
       if (g.ok) live++;
+      else dead.push({ key: keys[i], why: `chat ${g.status}` });
       console.log(`  ${g.ok ? '✔' : '✘'} ${keys[i].slice(0, 8)}… chat=${g.status} ${g.content || g.sample.slice(0, 60)}`);
     } catch (e) {
+      dead.push({ key: keys[i], why: String(e.message).slice(0, 90) });
       console.log(`  ✘ ${keys[i].slice(0, 8)}… ${String(e.message).slice(0, 90)}`);
     }
   }
+  writeDead(dead);
   console.log(`verify: ${live}/${keys.length} keys live (${MODEL} on ${BASE})`);
   process.exit(live === keys.length ? 0 : 1);
 }
